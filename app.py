@@ -1,23 +1,27 @@
+import io
 import math
+import folium
+from folium.features import DivIcon
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_folium import st_folium
 
 # 1. 페이지 설정
 st.set_page_config(page_title="배송 경로 최적화 & 배차 대시보드", layout="wide")
 
 st.title("🚚 배송 경로 최적화 & 배차 대시보드")
 st.caption(
-    "출발지: 경기도 용인시 당하로 159 | 차량 기준: 1톤(최대 70대 적재) |"
-    " 카카오모빌리티 도로망 API 연동"
+    "출발지: 경기도 용인시 당하로 159 | 차량 기준: 1톤(최대 70대 적재) | "
+    "대한민국 지도 기반 경유 순서(1, 2, 3...) 마커 표현"
 )
 
 # --- 사이드바 설정 및 API Key 입력 ---
 st.sidebar.header("🔑 API 설정")
 kakao_api_key = st.sidebar.text_input(
-    "Kakao REST API Key",
+    "Kakao REST API Key (선택)",
     type="password",
-    help="카카오 디벨로퍼스에서 발급받은 REST API 키를 입력하세요.",
+    help="입력 시 카카오 도로망 거리/시간을 정밀 계산합니다. 미입력 시 무료 지오코딩 및 기본 경유 순서로 동작합니다.",
 )
 
 st.sidebar.header("📁 데이터 업로드")
@@ -28,7 +32,6 @@ uploaded_file = st.sidebar.file_uploader(
 if uploaded_file is not None:
     df = pd.read_excel(uploaded_file)
 else:
-    # 자료샘플.xlsx 기반 예시 데이터셋
     data = [
         {
             "거래처명": "해병대교육훈련단",
@@ -90,23 +93,35 @@ else:
     ]
     df = pd.DataFrame(data)
 
-# 필수 컬럼 기본값 처리 (업로드 파일에 없을 경우 예외 방지)
 for col in ["받는사람", "전화번호", "요청담당자명"]:
     if col not in df.columns:
         df[col] = "-"
 
-# --- 출발지 설정 ---
 START_ADDRESS = "경기도 용인시 당하로 159"
 
 
-# --- 2. 카카오 API 함수 정의 ---
+# --- 2. 주소 좌표 변환 및 무료 지오코더 ---
+@st.cache_data
+def get_free_coordinates(address):
+    clean_addr = address.split("/")[0].strip()
+    url = f"https://nominatim.openstreetmap.org/search?format=json&q={clean_addr}"
+    headers = {"User-Agent": "StreamlitKoreaDeliveryApp/1.0"}
+    try:
+        res = requests.get(url, headers=headers, timeout=3)
+        if res.status_code == 200 and len(res.json()) > 0:
+            return float(res.json()[0]["lon"]), float(res.json()[0]["lat"])
+    except Exception:
+        pass
+    return 127.17, 37.24  # 용인 센터 기본 좌표
+
+
 @st.cache_data
 def get_coordinates(address, api_key):
     if not api_key:
-        return None, None
+        return get_free_coordinates(address)
     url = "https://dapi.kakao.com/v2/local/search/address.json"
     headers = {"Authorization": f"KakaoAK {api_key}"}
-    params = {"query": address}
+    params = {"query": address.split("/")[0].strip()}
     try:
         res = requests.get(url, headers=headers, params=params, timeout=5)
         if res.status_code == 200:
@@ -115,7 +130,7 @@ def get_coordinates(address, api_key):
                 return float(docs[0]["x"]), float(docs[0]["y"])
     except Exception:
         pass
-    return None, None
+    return get_free_coordinates(address)
 
 
 @st.cache_data
@@ -145,7 +160,7 @@ def get_kakao_route_info(origin_coord, dest_coord, api_key):
 start_lng, start_lat = get_coordinates(START_ADDRESS, kakao_api_key)
 
 
-# --- 3. 권역 구분 함수 ---
+# --- 3. 권역 구분 ---
 def get_region(addr):
     addr_str = str(addr)
     if "서울" in addr_str:
@@ -188,14 +203,14 @@ def get_region(addr):
 
 df["권역"] = df["배송지주소"].apply(get_region)
 
-# --- 4. 실제 도로망 기반 이동거리 및 이동시간 산출 ---
-if kakao_api_key:
-    coords_list = [
-        get_coordinates(addr, kakao_api_key) for addr in df["배송지주소"]
-    ]
-    df["경도"] = [c[0] for c in coords_list]
-    df["위도"] = [c[1] for c in coords_list]
+# --- 4. 좌표 계산 및 이동거리 산출 ---
+coords_list = [
+    get_coordinates(addr, kakao_api_key) for addr in df["배송지주소"]
+]
+df["경도"] = [c[0] for c in coords_list]
+df["위도"] = [c[1] for c in coords_list]
 
+if kakao_api_key:
     route_results = [
         get_kakao_route_info(
             (start_lng, start_lat), (row["경도"], row["위도"]), kakao_api_key
@@ -204,40 +219,14 @@ if kakao_api_key:
     ]
     df["도로망거리_km"] = [r[0] for r in route_results]
     df["이동시간_분"] = [r[1] for r in route_results]
-
     df = df.sort_values(by=["도로망거리_km", "배송지주소"]).reset_index(
         drop=True
     )
     st.sidebar.success("✅ 카카오 도로망 API 연동 완료")
 else:
-    region_proximity_order = [
-        "수도권(경기)",
-        "수도권(서울)",
-        "수도권(인천)",
-        "충청권(충북)",
-        "충청권(충남/대전)",
-        "강원권",
-        "호남권(전북)",
-        "호남권(전남/광주)",
-        "영남권(경북/대구)",
-        "영남권(경남/부산)",
-        "기타권역",
-    ]
-    df["권역우선순위"] = df["권역"].apply(
-        lambda x: (
-            region_proximity_order.index(x)
-            if x in region_proximity_order
-            else 99
-        )
-    )
     df["도로망거리_km"] = 0.0
     df["이동시간_분"] = 0.0
-    df = df.sort_values(by=["권역우선순위", "배송지주소"]).reset_index(
-        drop=True
-    )
-    st.sidebar.warning(
-        "⚠️ API Key 미입력: 기존 행정구역 우선순위로 정렬됩니다."
-    )
+    st.sidebar.info("ℹ️ 오픈 지오코더 기본 모드로 동작 중")
 
 # --- 5. 차량 배차 및 경유 순서 정렬 ---
 vehicle_counter = 1
@@ -246,7 +235,6 @@ dispatch_dict = {}
 for region, group in df.groupby("권역", sort=False):
     current_truck_qty = 0
     current_truck_num = None
-
     address_groups = group.groupby("배송지주소", sort=False)
 
     for addr, addr_df in address_groups:
@@ -277,17 +265,19 @@ for region, group in df.groupby("권역", sort=False):
 
 df["배차계획"] = df.index.map(dispatch_dict)
 
-# 경유 순서 부여
 seq_dict = {}
 for vehicle, v_group in df.groupby("배차계획", sort=False):
     unique_addrs = v_group.sort_values("도로망거리_km")["배송지주소"].unique()
-    addr_to_seq = {addr: f"{i+1}차 방문" for i, addr in enumerate(unique_addrs)}
+    addr_to_seq = {
+        addr: i + 1 for i, addr in enumerate(unique_addrs)
+    }  # 숫자 순서 저장
     for idx, row in v_group.iterrows():
         seq_dict[idx] = addr_to_seq[row["배송지주소"]]
 
-df["경유순서"] = df.index.map(seq_dict)
+df["경유순서_숫자"] = df.index.map(seq_dict)
+df["경유순서"] = df["경유순서_숫자"].apply(lambda x: f"{x}차 방문")
 
-# --- 6. 대시보드 지표 카드 (KPI) ---
+# --- 6. 대시보드 지표 카드 ---
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("총 배송 건수", f"{len(df)} 건")
 col2.metric("총 요청 수량", f"{df['요청수량'].sum()} 대")
@@ -303,36 +293,91 @@ col5.metric(
 
 st.markdown("---")
 
-# --- 7. 차량별 배차 요약 ---
-st.subheader("📊 차량별 적재 및 이동 현황 요약")
-summary_df = (
-    df.groupby(["배차계획", "권역"])
-    .agg(
-        총적재수량=("요청수량", "sum"),
-        경유지수=("배송지주소", "nunique"),
-        평균이동거리_km=("도로망거리_km", "mean"),
-        평균이동시간_분=("이동시간_분", "mean"),
-    )
-    .reset_index()
+# --- 7. 대한민국 지도 기반 경유 순서 표현 (Folium) ---
+st.subheader("🗺️ 대한민국 전용 지도 - 차량별 경유 순서(숫자 마커) 노선도")
+
+map_vehicles = df["배차계획"].unique().tolist()
+selected_vehicle_map = st.selectbox(
+    "노선도를 확인해볼 차량을 선택하세요", options=map_vehicles
 )
 
-summary_df["평균이동거리_km"] = summary_df["평균이동거리_km"].round(1)
-summary_df["평균이동시간_분"] = summary_df["평균이동시간_분"].round(1)
-
-st.dataframe(
-    summary_df[
-        [
-            "배차계획",
-            "권역",
-            "총적재수량",
-            "경유지수",
-            "평균이동거리_km",
-            "평균이동시간_분",
-        ]
-    ],
-    use_container_width=True,
-    hide_index=True,
+vehicle_map_df = (
+    df[df["배차계획"] == selected_vehicle_map]
+    .sort_values("경유순서_숫자")
+    .copy()
 )
+
+# Folium 대한민국 중심 지도 객체 생성
+m = folium.Map(
+    location=[start_lat, start_lng],
+    zoom_start=9,
+    tiles="OpenStreetMap",  # 필요 시 Vworld 등 한국 전용 지도 타일 교체 가능
+)
+
+# 1) 출발지 마커 (빨간색)
+folium.Marker(
+    location=[start_lat, start_lng],
+    popup="<b>[출발지]</b> 용인 물류센터",
+    tooltip="출발지: 용인시 당하로 159",
+    icon=folium.Icon(color="red", icon="home", prefix="fa"),
+).add_to(m)
+
+# 2) 경유지 마커 (경유 순서 번호 표시)
+path_coordinates = [(start_lat, start_lng)]
+
+for _, row in vehicle_map_df.iterrows():
+    lat, lng = row["위도"], row["경도"]
+    seq_num = row["경유순서_숫자"]
+    path_coordinates.append((lat, lng))
+
+    # 숫자가 선명하게 각인된 Custom HTML Marker 생성
+    icon_html = f"""
+    <div style="
+        background-color: #007bff;
+        border: 2px solid white;
+        border-radius: 50%;
+        color: white;
+        font-weight: bold;
+        text-align: center;
+        width: 30px;
+        height: 30px;
+        line-height: 26px;
+        font-size: 14px;
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.4);
+    ">{seq_num}</div>
+    """
+
+    popup_text = f"""
+    <div style="width: 200px;">
+        <b>[{seq_num}차 방문] {row['거래처명']}</b><br>
+        수량: {row['요청수량']} 대<br>
+        주소: {row['배송지주소']}<br>
+        수령인: {row['받는사람']} ({row['전화번호']})
+    </div>
+    """
+
+    folium.Marker(
+        location=[lat, lng],
+        popup=folium.Popup(popup_text, max_width=250),
+        tooltip=f"{seq_num}차 방문지: {row['거래처명']}",
+        icon=DivIcon(
+            icon_size=(30, 30), icon_anchor=(15, 15), html=icon_html
+        ),
+    ).add_to(m)
+
+# 3) 차량 점선 이동 경로선 (PolyLine) Draw
+folium.PolyLine(
+    locations=path_coordinates,
+    color="#0056b3",
+    weight=3.5,
+    opacity=0.8,
+    dash_array="6, 6",
+).add_to(m)
+
+# Streamlit 내에 Folium 지도 렌더링
+st_folium(m, width="100%", height=500)
+
+st.markdown("---")
 
 # --- 8. 상세 배송 리스트 ---
 st.subheader("📋 차량별 상세 경유 배송 순서 및 도로망 경로 정보")
@@ -343,9 +388,8 @@ selected_region = st.multiselect(
     default=df["권역"].unique(),
 )
 filtered_df = df[df["권역"].isin(selected_region)].copy()
-
 filtered_df = filtered_df.sort_values(
-    by=["배차계획", "경유순서", "도로망거리_km"]
+    by=["배차계획", "경유순서_숫자", "도로망거리_km"]
 ).reset_index(drop=True)
 
 display_df = filtered_df.copy()
@@ -353,7 +397,6 @@ display_df["배차계획_표시"] = display_df["배차계획"].mask(
     display_df["배차계획"].duplicated(), ""
 )
 
-# 🔥 받는사람, 전화번호, 요청담당자명 컬럼 추가
 cols_to_display = [
     "배차계획_표시",
     "경유순서",
@@ -370,7 +413,37 @@ cols_to_display = [
 if kakao_api_key:
     cols_to_display.extend(["도로망거리_km", "이동시간_분"])
 
-# hide_index=True로 인덱스열 제거하여 표기
+# 엑셀 다운로드 버퍼
+output = io.BytesIO()
+with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    filtered_df[
+        [
+            "배차계획",
+            "경유순서",
+            "권역",
+            "거래처명",
+            "배송지주소",
+            "받는사람",
+            "전화번호",
+            "요청담당자명",
+            "품목",
+            "요청수량",
+        ]
+    ].to_excel(writer, index=False, sheet_name="상세배차계획")
+processed_data = output.getvalue()
+
+btn_col1, btn_col2 = st.columns([1, 4])
+with btn_col1:
+    st.download_button(
+        label="📥 배차 결과 엑셀 다운로드",
+        data=processed_data,
+        file_name="배차최적화결과.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+with btn_col2:
+    if st.button("🖨️ 대시보드 인쇄 / PDF 저장"):
+        st.components.v1.html("<script>window.print();</script>", height=0)
+
 st.dataframe(
     display_df[cols_to_display].rename(columns={"배차계획_표시": "배차계획"}),
     use_container_width=True,
