@@ -1,5 +1,6 @@
 import io
 import math
+import re
 import folium
 from folium.features import DivIcon
 import pandas as pd
@@ -29,66 +30,32 @@ uploaded_file = st.sidebar.file_uploader(
     "자료샘플.xlsx 파일을 업로드하세요", type=["xlsx"]
 )
 
-if uploaded_file is not None:
-    df = pd.read_excel(uploaded_file)
-else:
-    data = [
-        {
-            "거래처명": "해병대교육훈련단",
-            "배송지주소": "인천시 남동구 청능대로 336",
-            "받는사람": "유진수",
-            "전화번호": "010-8699-5323",
-            "품목": "A3TC-5NBDN-AG003",
-            "요청수량": 47,
-            "요청담당자명": "이성훈",
-        },
-        {
-            "거래처명": "경상북도교육청 경상북도영천교육지원청",
-            "배송지주소": "경북 영천시 금호읍 관정1길 31",
-            "받는사람": "이례정보기술",
-            "전화번호": "010-2563-1190",
-            "품목": "A4TC-5NBDN-AH004",
-            "요청수량": 16,
-            "요청담당자명": "류주현",
-        },
-        {
-            "거래처명": "경상북도교육청 경상북도영천교육지원청",
-            "배송지주소": "경북 영천시 금호읍 금호로 179",
-            "받는사람": "이례정보기술",
-            "전화번호": "010-2563-1190",
-            "품목": "A4TC-5NBDN-AH004",
-            "요청수량": 31,
-            "요청담당자명": "류주현",
-        },
-        {
-            "거래처명": "세명대학교",
-            "배송지주소": "충북 제천시 용두대로 304",
-            "받는사람": "최명수",
-            "전화번호": "010-5485-0486",
-            "품목": "A4SC-5NBDN-AH002",
-            "요청수량": 19,
-            "요청담당자명": "강정호",
-        },
-        {
-            "거래처명": "경기도구리남양주교육청 내양초등학교",
-            "배송지주소": "경기 구리시 동구릉로 485",
-            "받는사람": "이현주",
-            "전화번호": "031-571-6669",
-            "품목": "A4SC-4NBDF-AH004",
-            "요청수량": 1,
-            "요청담당자명": "변현준",
-        },
-        {
-            "거래처명": "광주광역시 동구청",
-            "배송지주소": "광주광역시 동구 서남로 1",
-            "받는사람": "이승철",
-            "전화번호": "010-5640-0007",
-            "품목": "A4TC-5NBDN-AH000",
-            "요청수량": 32,
-            "요청담당자명": "윤가은",
-        },
-    ]
-    df = pd.DataFrame(data)
+# --- 데이터 업로드 여부 체크 ---
+if uploaded_file is None:
+    st.info("👈 좌측 사이드바에서 [자료샘플.xlsx] 파일을 업로드해 주세요.")
+    st.stop()  # 파일이 업로드되지 않으면 여기서 실행을 멈춤
+
+# 엑셀 파일 로드
+df = pd.read_excel(uploaded_file)
+
+# --- 배송지 주소 정제 함수 (도로명 또는 지번 주소 건물번호/번지수까지만 추출) ---
+def clean_address(addr):
+    if not isinstance(addr, str) or not addr.strip():
+        return ""
+    clean = addr.split("/")[0].split("(")[0].replace(",", " ").strip()
+    
+    doro_match = re.search(r"^(.*?[가-힣A-Za-z0-9]+(?:로|길)\s+\d+(?:-\d+)?)", clean)
+    if doro_match:
+        return doro_match.group(1).strip()
+        
+    jibeon_match = re.search(r"^(.*?[가-힣A-Za-z0-9]+(?:읍|면|동|리)\s+\d+(?:-\d+)?)", clean)
+    if jibeon_match:
+        return jibeon_match.group(1).strip()
+        
+    return clean
+
+# 배송지주소 정제 적용
+df["배송지주소"] = df["배송지주소"].apply(clean_address)
 
 for col in ["받는사람", "전화번호", "요청담당자명"]:
     if col not in df.columns:
@@ -108,8 +75,7 @@ def calculate_haversine(lon1, lat1, lon2, lat2):
 # --- 2. 주소 좌표 변환 및 무료 지오코더 ---
 @st.cache_data
 def get_free_coordinates(address):
-    # 정제: 특수문자 및 비고 제거
-    clean_addr = address.split("/")[0].split("(")[0].strip()
+    clean_addr = clean_address(address)
     url = f"https://nominatim.openstreetmap.org/search?format=json&q={clean_addr}"
     headers = {"User-Agent": "StreamlitKoreaDeliveryApp/1.0"}
     try:
@@ -118,12 +84,11 @@ def get_free_coordinates(address):
             return float(res.json()[0]["lon"]), float(res.json()[0]["lat"])
     except Exception:
         pass
-    # 주소 검색 실패 시 기본 위치 분산 (겹침 방지용)
     return 127.17, 37.24
 
 @st.cache_data
 def get_coordinates(address, api_key):
-    clean_addr = address.split("/")[0].split("(")[0].strip()
+    clean_addr = clean_address(address)
     if not api_key:
         return get_free_coordinates(clean_addr)
     url = "https://dapi.kakao.com/v2/local/search/address.json"
@@ -197,7 +162,6 @@ coords_list = [get_coordinates(addr, kakao_api_key) for addr in df["배송지주
 df["경도"] = [c[0] for c in coords_list]
 df["위도"] = [c[1] for c in coords_list]
 
-# API Key 유무와 관계없이 거리를 정확히 산출 (미입력 시 하버사인 직선거리 계산)
 if kakao_api_key:
     route_results = [
         get_kakao_route_info((start_lng, start_lat), (row["경도"], row["위도"]), kakao_api_key)
@@ -211,7 +175,7 @@ else:
         round(calculate_haversine(start_lng, start_lat, row["경도"], row["위도"]), 1)
         for _, row in df.iterrows()
     ]
-    df["이동시간_분"] = round(df["도로망거리_km"] * 1.5, 1) # 기본 추정 시간
+    df["이동시간_분"] = round(df["도로망거리_km"] * 1.5, 1)
     st.sidebar.info("ℹ️ 직선거리 기반 모드로 동작 중 (카카오 API 입력 시 도로망 거리로 자동 전환)")
 
 df = df.sort_values(by=["도로망거리_km", "배송지주소"]).reset_index(drop=True)
@@ -249,10 +213,8 @@ for region, group in df.groupby("권역", sort=False):
 
 df["배차계획"] = df.index.map(dispatch_dict)
 
-# 방문 순서(1, 2, 3...) 정확한 정렬 매핑
 seq_dict = {}
 for vehicle, v_group in df.groupby("배차계획", sort=False):
-    # 거리 기준으로 유니크 주소 정렬
     sorted_unique_addrs = v_group.sort_values("도로망거리_km")["배송지주소"].unique()
     addr_to_seq = {addr: i + 1 for i, addr in enumerate(sorted_unique_addrs)}
     for idx, row in v_group.iterrows():
@@ -277,7 +239,6 @@ st.subheader("🗺️ 대한민국 전용 지도 - 차량별 경유 순서(숫�
 map_vehicles = df["배차계획"].unique().tolist()
 selected_vehicle_map = st.selectbox("노선도를 확인해볼 차량을 선택하세요", options=map_vehicles)
 
-# 동일 주소(배송지) 중복 데이터 제거 후 대표 마커 작성
 vehicle_map_df = (
     df[df["배차계획"] == selected_vehicle_map]
     .sort_values("경유순서_숫자")
@@ -285,7 +246,6 @@ vehicle_map_df = (
     .copy()
 )
 
-# 지도 중심 설정 (선택된 차량의 첫 번째 배송지 기준)
 center_lat = vehicle_map_df["위도"].iloc[0] if len(vehicle_map_df) > 0 else start_lat
 center_lng = vehicle_map_df["경도"].iloc[0] if len(vehicle_map_df) > 0 else start_lng
 
@@ -295,7 +255,6 @@ m = folium.Map(
     tiles="OpenStreetMap",
 )
 
-# 1) 출발지 마커 (빨간색)
 folium.Marker(
     location=[start_lat, start_lng],
     popup="<b>[출발지]</b> 용인 물류센터",
@@ -303,7 +262,6 @@ folium.Marker(
     icon=folium.Icon(color="red", icon="home", prefix="fa"),
 ).add_to(m)
 
-# 2) 경유지 마커 (순서대로 라인 연결)
 path_coordinates = [(start_lat, start_lng)]
 
 for _, row in vehicle_map_df.iterrows():
@@ -311,12 +269,10 @@ for _, row in vehicle_map_df.iterrows():
     seq_num = row["경유순서_숫자"]
     path_coordinates.append((lat, lng))
 
-    # 해당 주소의 총 배송 수량 및 거래처 모음
     same_addr_rows = df[(df["배차계획"] == selected_vehicle_map) & (df["배송지주소"] == row["배송지주소"])]
     total_qty = same_addr_rows["요청수량"].sum()
     names = ", ".join(same_addr_rows["거래처명"].unique())
 
-    # 숫자가 각인된 Custom Marker
     icon_html = f"""
     <div style="
         background-color: #007bff;
@@ -352,7 +308,6 @@ for _, row in vehicle_map_df.iterrows():
         ),
     ).add_to(m)
 
-# 3) 이동 경로선 Draw
 folium.PolyLine(
     locations=path_coordinates,
     color="#0056b3",
