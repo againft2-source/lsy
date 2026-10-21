@@ -1,7 +1,6 @@
 import io
 import math
 import re
-import time
 import folium
 from folium.features import DivIcon
 import pandas as pd
@@ -11,6 +10,37 @@ from streamlit_folium import st_folium
 
 # 1. 페이지 설정
 st.set_page_config(page_title="배송 경로 최적화 & 배차 대시보드", layout="wide")
+
+# ==========================================
+# 인쇄/PDF 저장용 CSS (사이드바 및 버튼 숨김, 본문 전체 인쇄)
+# ==========================================
+st.markdown(
+    """
+    <style>
+    @media print {
+        /* 사이드바, 헤더, 버튼 등 인쇄 시 불필요한 요소 숨김 */
+        [data-testid="stSidebar"], 
+        header, 
+        footer, 
+        .stButton, 
+        .stDownloadButton,
+        [data-testid="stHeader"] {
+            display: none !important;
+        }
+        /* 본문 영역 전체 너비 확장 */
+        .main .block-container {
+            max-width: 100% !important;
+            padding: 1rem !important;
+        }
+        /* 페이지 잘림 방지 */
+        body {
+            visibility: visible !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("🚚 배송 경로 최적화 & 배차 대시보드")
 st.caption(
@@ -23,7 +53,7 @@ st.sidebar.header("🔑 API 설정")
 kakao_api_key = st.sidebar.text_input(
     "Kakao REST API Key (선택)",
     type="password",
-    help="입력 시 카카오 도로망 거리/시간 및 실제 주소 위치를 정확하게 연동합니다.",
+    help="입력 시 카카오 도로망 거리/시간을 정밀 계산합니다. 미입력 시 직선거리 기반 최적 순서로 동작합니다.",
 )
 
 st.sidebar.header("📁 데이터 업로드")
@@ -31,116 +61,157 @@ uploaded_file = st.sidebar.file_uploader(
     "자료샘플.xlsx 파일을 업로드하세요", type=["xlsx"]
 )
 
+# --- 데이터 업로드 여부 체크 ---
 if uploaded_file is None:
     st.info("👈 좌측 사이드바에서 [자료샘플.xlsx] 파일을 업로드해 주세요.")
-    st.stop()
+    st.stop()  # 파일이 업로드되지 않으면 여기서 실행을 멈춤
 
+# 엑셀 파일 로드
 df = pd.read_excel(uploaded_file)
 
-# --- 주소 동일성 판단 및 지오코딩을 위한 표준 주소 정제 함수 ---
-def normalize_address(addr):
-    if not isinstance(addr, str) or not addr.strip():
-        return ""
-    # 1. 괄호() 및 괄호 안 내용 완전 제거
-    clean = re.sub(r"\(.*?\)", "", addr)
-    # 2. 슬래시(/), 쉼표 등 제거 및 잉여 공백 정리
-    clean = clean.split("/")[0].replace(",", " ").strip()
-    clean = re.sub(r"\s+", " ", clean)
-    
-    # 3. 도로명/지번 본번까지만 추출 (부속 건물명 제거)
-    doro_match = re.search(r"^(.*?[가-힣A-Za-z0-9]+(?:로|길)\s+\d+(?:-\d+)?)", clean)
-    if doro_match:
-        return doro_match.group(1).strip()
-        
-    jibeon_match = re.search(r"^(.*?[가-힣A-Za-z0-9]+(?:읍|면|동|리)\s+\d+(?:-\d+)?)", clean)
-    if jibeon_match:
-        return jibeon_match.group(1).strip()
-        
-    return clean
 
-# 주소 판별용 표준 주소 컬럼 생성
-df["배송지주소_표준"] = df["배송지주소"].apply(normalize_address)
+# ==========================================
+# 개인정보 마스킹 함수 (보안 처리)
+# ==========================================
+def mask_name(name):
+    """이름 마스킹: 성만 남기고 나머지는 '*' 처리 (예: 홍길동 -> 홍**)"""
+    if not isinstance(name, str) or not name.strip() or name == "-":
+        return name
+    name = name.strip()
+    if len(name) <= 1:
+        return name
+    return name[0] + "*" * (len(name) - 1)
 
+
+def mask_phone(phone):
+    """전화번호 마스킹: 가운데 번호 '*' 처리 (예: 010-1111-2222 -> 010-****-2222)"""
+    if not isinstance(phone, str) or not phone.strip() or phone == "-":
+        return phone
+    phone = phone.strip()
+    pattern = r"(\d{2,3})-(\d{3,4})-(\d{4})"
+
+    def repl(m):
+        prefix = m.group(1)
+        mid = m.group(2)
+        last = m.group(3)
+        return f"{prefix}-{'*' * len(mid)}-{last}"
+
+    return re.sub(pattern, repl, phone)
+
+
+# 필수 컬럼 존재 여부 체크 및 기본값 보장
 for col in ["받는사람", "전화번호", "요청담당자명"]:
     if col not in df.columns:
         df[col] = "-"
 
+# 보안 마스킹 적용
+df["받는사람"] = df["받는사람"].apply(mask_name)
+df["요청담당자명"] = df["요청담당자명"].apply(mask_name)
+df["전화번호"] = df["전화번호"].apply(mask_phone)
+
+
+# --- 배송지 주소 정제 함수 (도로명 또는 지번 주소 건물번호/번지수까지만 추출) ---
+def clean_address(addr):
+    if not isinstance(addr, str) or not addr.strip():
+        return ""
+    clean = addr.split("/")[0].split("(")[0].replace(",", " ").strip()
+
+    doro_match = re.search(
+        r"^(.*?[가-힣A-Za-z0-9]+(?:로|길)\s+\d+(?:-\d+)?)", clean
+    )
+    if doro_match:
+        return doro_match.group(1).strip()
+
+    jibeon_match = re.search(
+        r"^(.*?[가-힣A-Za-z0-9]+(?:읍|면|동|리)\s+\d+(?:-\d+)?)", clean
+    )
+    if jibeon_match:
+        return jibeon_match.group(1).strip()
+
+    return clean
+
+
+# 배송지주소 정제 적용
+df["배송지주소"] = df["배송지주소"].apply(clean_address)
+
 START_ADDRESS = "경기도 용인시 당하로 159"
+
 
 # --- 하버사인 공식 (직선거리 계산함수) ---
 def calculate_haversine(lon1, lat1, lon2, lat2):
-    R = 6371.0 # 지구 반지름(km)
+    R = 6371.0  # 지구 반지름(km)
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-# --- 2. 주소 좌표 변환 함수 ---
-@st.cache_data(show_spinner=False)
-def get_free_coordinates(address, idx=0):
-    if not address:
-        return 127.175, 37.241
-        
-    url = f"https://nominatim.openstreetmap.org/search?format=json&q={address}"
-    headers = {"User-Agent": "StreamlitDeliveryDashboard/5.0"}
-    
+
+# --- 2. 주소 좌표 변환 및 무료 지오코더 ---
+@st.cache_data
+def get_free_coordinates(address):
+    clean_addr = clean_address(address)
+    url = f"https://nominatim.openstreetmap.org/search?format=json&q={clean_addr}"
+    headers = {"User-Agent": "StreamlitKoreaDeliveryApp/1.0"}
     try:
-        time.sleep(0.1)
         res = requests.get(url, headers=headers, timeout=3)
         if res.status_code == 200 and len(res.json()) > 0:
             return float(res.json()[0]["lon"]), float(res.json()[0]["lat"])
     except Exception:
         pass
-    
-    # 지오코딩 실패 시 용인 출발지 기준 남쪽 방향 오프셋 (충북/경북 방향 오프셋)
-    return 127.45 + ((idx % 5) * 0.05), 36.90 - ((idx % 5) * 0.05)
+    return 127.17, 37.24
 
-@st.cache_data(show_spinner=False)
-def get_coordinates(address, api_key, idx=0):
+
+@st.cache_data
+def get_coordinates(address, api_key):
+    clean_addr = clean_address(address)
     if not api_key:
-        return get_free_coordinates(address, idx)
-        
+        return get_free_coordinates(clean_addr)
     url = "https://dapi.kakao.com/v2/local/search/address.json"
-    headers = {"Authorization": f"KakaoAK {api_key.strip()}"}
-    params = {"query": address}
+    headers = {"Authorization": f"KakaoAK {api_key}"}
+    params = {"query": clean_addr}
     try:
-        res = requests.get(url, headers=headers, params=params, timeout=3)
+        res = requests.get(url, headers=headers, params=params, timeout=5)
         if res.status_code == 200:
             docs = res.json().get("documents")
-            if docs and len(docs) > 0:
+            if docs:
                 return float(docs[0]["x"]), float(docs[0]["y"])
     except Exception:
         pass
-    return get_free_coordinates(address, idx)
+    return get_free_coordinates(clean_addr)
 
-@st.cache_data(show_spinner=False)
+
+@st.cache_data
 def get_kakao_route_info(origin_coord, dest_coord, api_key):
-    if not api_key:
-        return None, None
+    if not api_key or None in origin_coord or None in dest_coord:
+        return float("inf"), 0
 
     url = "https://apis-navi.kakaomobility.com/v1/directions"
-    headers = {"Authorization": f"KakaoAK {api_key.strip()}"}
+    headers = {"Authorization": f"KakaoAK {api_key}"}
     params = {
         "origin": f"{origin_coord[0]},{origin_coord[1]}",
         "destination": f"{dest_coord[0]},{dest_coord[1]}",
         "priority": "RECOMMEND",
     }
     try:
-        res = requests.get(url, headers=headers, params=params, timeout=3)
+        res = requests.get(url, headers=headers, params=params, timeout=5)
         if res.status_code == 200:
-            routes = res.json().get("routes", [])
-            if routes and "summary" in routes[0]:
-                summary = routes[0]["summary"]
-                distance_km = round(summary["distance"] / 1000.0, 1)
-                duration_min = round(summary["duration"] / 60.0, 1)
-                return distance_km, duration_min
+            summary = res.json()["routes"][0]["summary"]
+            distance_km = round(summary["distance"] / 1000.0, 1)
+            duration_min = round(summary["duration"] / 60.0, 1)
+            return distance_km, duration_min
     except Exception:
         pass
-    return None, None
+    return float("inf"), 0
 
-# 출발지 좌표 (용인 물류센터)
-start_lng, start_lat = 127.175, 37.241
+
+start_lng, start_lat = get_coordinates(START_ADDRESS, kakao_api_key)
+
 
 # --- 3. 권역 구분 ---
 def get_region(addr):
@@ -153,76 +224,87 @@ def get_region(addr):
         return "수도권(경기)"
     elif "충북" in addr_str or "충청북도" in addr_str:
         return "충청권(충북)"
-    elif "충남" in addr_str or "충청남도" in addr_str or "대전" in addr_str or "세종" in addr_str:
+    elif (
+        "충남" in addr_str
+        or "충청남도" in addr_str
+        or "대전" in addr_str
+        or "세종" in addr_str
+    ):
         return "충청권(충남/대전)"
-    elif "전북" in addr_str or "전북특별자치도" in addr_str or "전라북도" in addr_str:
+    elif (
+        "전북" in addr_str
+        or "전북특별자치도" in addr_str
+        or "전라북도" in addr_str
+    ):
         return "호남권(전북)"
     elif "전남" in addr_str or "전라남도" in addr_str or "광주" in addr_str:
         return "호남권(전남/광주)"
     elif "경북" in addr_str or "경상북도" in addr_str or "대구" in addr_str:
         return "영남권(경북/대구)"
-    elif "경남" in addr_str or "경상남도" in addr_str or "부산" in addr_str or "울산" in addr_str:
+    elif (
+        "경남" in addr_str
+        or "경상남도" in addr_str
+        or "부산" in addr_str
+        or "울산" in addr_str
+    ):
         return "영남권(경남/부산)"
     elif "강원" in addr_str:
         return "강원권"
     else:
         return "기타권역"
 
-df["권역"] = df["배송지주소_표준"].apply(get_region)
 
-# --- 4. 좌표 계산 및 이동거리 산출 (표준 주소 기반 계산) ---
-with st.spinner("주소 좌표 계산 및 최적 경로 구성 중..."):
-    # 동일한 표준 주소는 매번 지오코딩하지 않도록 딕셔너리로 좌표 캐싱
-    unique_std_addrs = df["배송지주소_표준"].unique()
-    addr_coord_map = {}
-    for i, addr in enumerate(unique_std_addrs):
-        addr_coord_map[addr] = get_coordinates(addr, kakao_api_key, i+1)
+df["권역"] = df["배송지주소"].apply(get_region)
 
-    df["경도"] = df["배송지주소_표준"].map(lambda a: addr_coord_map[a][0])
-    df["위도"] = df["배송지주소_표준"].map(lambda a: addr_coord_map[a][1])
-
-    distances = []
-    times = []
-
-    for idx, row in df.iterrows():
-        dist, dur = None, None
-        if kakao_api_key:
-            dist, dur = get_kakao_route_info((start_lng, start_lat), (row["경도"], row["위도"]), kakao_api_key)
-        
-        if dist is None or dist == 0.0:
-            raw_dist = calculate_haversine(start_lng, start_lat, row["경도"], row["위도"])
-            dist = round(max(raw_dist * 1.3, 5.0), 1)
-            dur = round(dist * 1.5, 1)
-
-        distances.append(dist)
-        times.append(dur)
-
-    df["도로망거리_km"] = distances
-    df["이동시간_분"] = times
+# --- 4. 좌표 계산 및 이동거리 산출 ---
+coords_list = [get_coordinates(addr, kakao_api_key) for addr in df["배송지주소"]]
+df["경도"] = [c[0] for c in coords_list]
+df["위도"] = [c[1] for c in coords_list]
 
 if kakao_api_key:
+    route_results = [
+        get_kakao_route_info(
+            (start_lng, start_lat), (row["경도"], row["위도"]), kakao_api_key
+        )
+        for _, row in df.iterrows()
+    ]
+    df["도로망거리_km"] = [r[0] for r in route_results]
+    df["이동시간_분"] = [r[1] for r in route_results]
     st.sidebar.success("✅ 카카오 도로망 API 연동 완료")
 else:
-    st.sidebar.info("ℹ️ 직선거리 기반 모드로 동작 중")
+    df["도로망거리_km"] = [
+        round(
+            calculate_haversine(
+                start_lng, start_lat, row["경도"], row["위도"]
+            ),
+            1,
+        )
+        for _, row in df.iterrows()
+    ]
+    df["이동시간_분"] = round(df["도로망거리_km"] * 1.5, 1)
+    st.sidebar.info(
+        "ℹ️ 직선거리 기반 모드로 동작 중 (카카오 API 입력 시 도로망 거리로 자동 전환)"
+    )
 
-df = df.sort_values(by=["도로망거리_km", "배송지주소_표준"]).reset_index(drop=True)
+df = df.sort_values(by=["도로망거리_km", "배송지주소"]).reset_index(drop=True)
 
-# --- 5. 차량 배차 및 경유 순서 정렬 (표준주소 기준 그룹핑) ---
+# --- 5. 차량 배차 및 경유 순서 정렬 ---
 vehicle_counter = 1
 dispatch_dict = {}
 
 for region, group in df.groupby("권역", sort=False):
     current_truck_qty = 0
     current_truck_num = None
-    # 핵심: 표기용 원본주소가 아닌 표준주소(배송지주소_표준)로 그룹핑하여 동일장소 통합
-    address_groups = group.groupby("배송지주소_표준", sort=False)
+    address_groups = group.groupby("배송지주소", sort=False)
 
-    for std_addr, addr_df in address_groups:
+    for addr, addr_df in address_groups:
         addr_qty = addr_df["요청수량"].sum()
 
         if addr_qty > 70:
             trucks_needed = math.ceil(addr_qty / 70)
-            v_list = [f"차량 {vehicle_counter + i:02d}" for i in range(trucks_needed)]
+            v_list = [
+                f"차량 {vehicle_counter + i:02d}" for i in range(trucks_needed)
+            ]
             vehicle_counter += trucks_needed
             v_str = f"[단독배차] {region} ({addr_qty}대 / 1톤 {','.join(v_list)})"
             for idx in addr_df.index:
@@ -241,13 +323,14 @@ for region, group in df.groupby("권역", sort=False):
 
 df["배차계획"] = df.index.map(dispatch_dict)
 
-# 경유 순서 결정 (표준 주소 기준으로 동일 번호 부여)
 seq_dict = {}
 for vehicle, v_group in df.groupby("배차계획", sort=False):
-    sorted_unique_addrs = v_group.sort_values("도로망거리_km")["배송지주소_표준"].unique()
+    sorted_unique_addrs = v_group.sort_values("도로망거리_km")[
+        "배송지주소"
+    ].unique()
     addr_to_seq = {addr: i + 1 for i, addr in enumerate(sorted_unique_addrs)}
     for idx, row in v_group.iterrows():
-        seq_dict[idx] = addr_to_seq[row["배송지주소_표준"]]
+        seq_dict[idx] = addr_to_seq[row["배송지주소"]]
 
 df["경유순서_숫자"] = df.index.map(seq_dict)
 df["경유순서"] = df["경유순서_숫자"].apply(lambda x: f"{x}차 방문")
@@ -266,18 +349,23 @@ st.markdown("---")
 st.subheader("🗺️ 대한민국 전용 지도 - 차량별 경유 순서(숫자 마커) 노선도")
 
 map_vehicles = df["배차계획"].unique().tolist()
-selected_vehicle_map = st.selectbox("노선도를 확인해볼 차량을 선택하세요", options=map_vehicles)
+selected_vehicle_map = st.selectbox(
+    "노선도를 확인해볼 차량을 선택하세요", options=map_vehicles
+)
 
-# 동일 방문지는 하나로 합쳐서 마커 표시
 vehicle_map_df = (
     df[df["배차계획"] == selected_vehicle_map]
     .sort_values("경유순서_숫자")
-    .drop_duplicates(subset=["배송지주소_표준"])
+    .drop_duplicates(subset=["배송지주소"])
     .copy()
 )
 
-center_lat = vehicle_map_df["위도"].iloc[0] if len(vehicle_map_df) > 0 else start_lat
-center_lng = vehicle_map_df["경도"].iloc[0] if len(vehicle_map_df) > 0 else start_lng
+center_lat = (
+    vehicle_map_df["위도"].iloc[0] if len(vehicle_map_df) > 0 else start_lat
+)
+center_lng = (
+    vehicle_map_df["경도"].iloc[0] if len(vehicle_map_df) > 0 else start_lng
+)
 
 m = folium.Map(
     location=[center_lat, center_lng],
@@ -299,7 +387,10 @@ for _, row in vehicle_map_df.iterrows():
     seq_num = row["경유순서_숫자"]
     path_coordinates.append((lat, lng))
 
-    same_addr_rows = df[(df["배차계획"] == selected_vehicle_map) & (df["배송지주소_표준"] == row["배송지주소_표준"])]
+    same_addr_rows = df[
+        (df["배차계획"] == selected_vehicle_map)
+        & (df["배송지주소"] == row["배송지주소"])
+    ]
     total_qty = same_addr_rows["요청수량"].sum()
     names = ", ".join(same_addr_rows["거래처명"].unique())
 
@@ -320,7 +411,7 @@ for _, row in vehicle_map_df.iterrows():
     """
 
     popup_text = f"""
-    <div style="width: 240px;">
+    <div style="width: 220px;">
         <b style="color:#007bff;">[{seq_num}차 방문지]</b><br>
         <b>거래처:</b> {names}<br>
         <b>총 수량:</b> {total_qty} 대<br>
@@ -331,7 +422,7 @@ for _, row in vehicle_map_df.iterrows():
 
     folium.Marker(
         location=[lat, lng],
-        popup=folium.Popup(popup_text, max_width=280),
+        popup=folium.Popup(popup_text, max_width=260),
         tooltip=f"{seq_num}차 방문: {names}",
         icon=DivIcon(
             icon_size=(32, 32), icon_anchor=(16, 16), html=icon_html
@@ -346,7 +437,7 @@ folium.PolyLine(
     dash_array="6, 6",
 ).add_to(m)
 
-st_folium(m, width="100%", height=520, key=f"map_{selected_vehicle_map}")
+st_folium(m, width="100%", height=520)
 
 st.markdown("---")
 
@@ -373,7 +464,7 @@ cols_to_display = [
     "경유순서",
     "권역",
     "거래처명",
-    "배송지주소", # 엑셀 원본 주소 표시
+    "배송지주소",
     "받는사람",
     "전화번호",
     "요청담당자명",
@@ -412,8 +503,11 @@ with btn_col1:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 with btn_col2:
+    # window.parent.print() 호출로 부모 창(Streamlit 전체)을 인쇄합니다.
     if st.button("🖨️ 대시보드 인쇄 / PDF 저장"):
-        st.components.v1.html("<script>window.print();</script>", height=0)
+        st.components.v1.html(
+            "<script>window.parent.print();</script>", height=0
+        )
 
 st.dataframe(
     display_df[cols_to_display].rename(columns={"배차계획_표시": "배차계획"}),
